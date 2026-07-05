@@ -1,0 +1,15 @@
+[package]
+name = "grill-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# STT (Parakeet, CPU EP) + Silero VAD, both on ort =2.0.0-rc.12.
+# `onnx` = Parakeet ONNX engine; `vad-silero` = built-in Silero VAD (also via ort).
+# Whisper+Metal fallback is a one-line add later: features = [..., "whisper-metal"].
+# CoreML EP is opt-in via "ort-coreml" (flaky for Parakeet — stay on CPU for now).
+transcribe-rs = { version = "0.3.11", features = ["onnx", "vad-silero"] }
+# TTS — Kokoro-82M; pins ort ^2.0.0-rc.12, unifies with transcribe-rs's rc.12.
+kokoro-tts = "0.3.3"
+# Direct ort handle for the self-wired smart-turn-v3 endpointing model — same rc.12.
+ort = "=2.0.0-rc.12"
