@@ -1,18 +1,30 @@
 ---
 id: "0006"
-title: Code-mode surface and native-tool fallback across CLIs
+title: Package as a Claude Code plugin (skill + MCP binary)
 type: wayfinder:prototype
 status: open
 assignee:
-blocked_by: ["0002", "0007"]
+blocked_by: ["0002"]
 ---
 
 ## Question
 
-How is the Code Mode surface delivered, and how does it degrade gracefully where code-exec isn't available? Design and prove:
+> **Reframed by 0007.** Original scope was "code-mode surface + native-tool fallback across CLIs." Research (0007) found **code mode is unavailable in every CLI** and narrowed scope to **Claude Code only**, so there is no code-mode surface and no cross-CLI fallback to build. What remains is the packaging that makes install one-step.
 
-- The **generated TS API** the agent writes code against (the plumbing turns — start/end/abort/retry — collapse into single script runs; `ask` stays a main-context boundary).
-- The **fallback to native MCP tool calls** on CLIs without code-execution-of-MCP (per 0007's findings — likely Gemini/opencode).
-- Verify the context savings are real (schemas load on demand; plumbing chatter doesn't accumulate) without leaking the per-turn reasoning out of main context.
+How is the whole thing delivered as a single low-friction Claude Code install? Design and prove a **plugin** that bundles both the skill and the MCP server:
 
-Resolves into a code-mode delivery spec + a demonstration that the same skill works via code-mode on Claude Code and via native tools on a fallback CLI.
+```
+grill-plugin/
+  .claude-plugin/plugin.json
+  skills/grill-wayfinder/SKILL.md
+  bin/grill-mcp                 # the Rust binary
+  .mcp.json                     # command: ${CLAUDE_PLUGIN_ROOT}/bin/grill-mcp, alwaysLoad: true
+```
+
+Resolve:
+- **`.mcp.json`** pointing at `${CLAUDE_PLUGIN_ROOT}/bin/grill-mcp`, `alwaysLoad: true` (3-tool surface always visible, no ToolSearch step), explicit `timeout` as hygiene.
+- **Binary distribution**: per-platform blobs + exec bit vendored in the plugin, OR a thin wrapper that downloads/builds on first run. Keep runtime state in `${CLAUDE_PLUGIN_DATA}` (plugin root changes on update).
+- **Model weights**: bundled vs first-run download (ties to 0003's footprint decision).
+- **Marketplace** distribution (`marketplace.json`), `defaultEnabled: false`.
+
+Resolves when a `/plugin install` brings up the skill + auto-started MCP server and a grilling turn works end to end on Claude Code. Depends on the transport prototype (0002).

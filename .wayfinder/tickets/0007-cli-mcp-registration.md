@@ -2,8 +2,8 @@
 id: "0007"
 title: Map MCP-server registration across target CLIs
 type: wayfinder:research
-status: open
-assignee:
+status: closed
+assignee: jonstuebe
 blocked_by: []
 ---
 
@@ -20,3 +20,19 @@ Additionally, per the resolved contract (0001), verify for each CLI: support for
 Also capture: how a skill ships *alongside* a binary across these CLIs, and the first-run model-download UX expectations. This decides how much of the code-mode surface is portable vs Claude-Code-first, and it shapes both the prototype (0002) and the code-mode ticket (0006).
 
 Resolves into a research summary (linked asset) covering registration + code-exec support per CLI.
+
+## Resolution
+
+Full findings: **[CLI MCP support matrix](../assets/0007-cli-mcp-support.md)** (all three CLIs, with config snippets and citations).
+
+Two decisive findings:
+
+1. **Code mode is unavailable in *every* CLI.** Model-written code calling MCP tools in a sandbox is an Anthropic API / Agent SDK pattern, not a feature of Claude Code, opencode, or Gemini CLI. All three do **native per-tool calls**. Claude Code's context-reduction mechanism is **MCP Tool Search / `alwaysLoad`**, not code execution. → Reverses spine decision #2; reframes ticket 0006.
+2. **Blocking-`ask` viability is per-CLI:** Claude Code works **natively** (stdio exempt from idle timeout, ~28 h per-tool default); opencode needs progress heartbeats + ≥ v1.17.8; Gemini has a ~60 s hard wall with progress/cancellation broken.
+
+**Decision (user, this session): focus on Claude Code only for now.** Multi-CLI support (opencode is close via `.claude/skills/` compatibility; Gemini is degraded) is deferred to Fog. Consequences:
+
+- The blocking `ask` needs **no timeout workaround** on Claude Code stdio — the sub-60 s cap and heartbeat-to-survive-timeout concerns are multi-CLI issues, now deferred. Progress notifications are still worth emitting for the rendered "listening" indicator.
+- **Cancellation stays defensive:** handle `notifications/cancelled` AND stdin-close / broken-pipe (ESC cancels the call without killing the stdio server, but a clean `cancelled` isn't doc-guaranteed).
+- **Packaging path:** ship as a **Claude Code plugin** (skill + `.mcp.json` + bundled binary via `${CLAUDE_PLUGIN_ROOT}`, `alwaysLoad: true`) — the low-friction one-install path. Reframes ticket 0006 into plugin packaging.
+
