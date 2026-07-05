@@ -28,6 +28,8 @@ A validated architecture and spec for a **voice-grilling skill + local CLI** tha
 
 <!-- index — one line per closed ticket, then zoom the link for detail -->
 
+- [Design the MCP ask/session contract](tickets/0001-mcp-ask-contract.md) — three tools (`begin?` / blocking-`ask`-with-progress-heartbeats / `end`) over one implicit session, no IDs; `answer = {transcript, status, confidence, duration_ms, detail?}`; abort via native MCP cancellation; binary reports mechanical facts, skill interprets all meaning.
+
 ## Fog
 
 - **Persistent OS-level daemon** (launchd/systemd, always-warm across CLI restarts) — revisit only if repeated cold-start model loads prove annoying in practice.
