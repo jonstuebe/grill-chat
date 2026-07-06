@@ -36,6 +36,7 @@ A validated architecture and spec for a **voice-grilling skill + local CLI** tha
 ## Fog
 
 - **Multi-CLI support** — scope is now Claude Code only. **opencode** is close (reads `.claude/skills/`; needs progress heartbeats + ≥ v1.17.8). **Gemini CLI** is degraded (~60 s hard timeout, progress/cancellation broken) — would need a sub-60 s max-answer cap. Revisit after the Claude Code path is proven.
+- **TTS first-audio latency** — non-streaming `synth()` measured 553 ms (over the 400 ms bar) in 0002; `kokoros` streaming API emits the first chunk in ~100 ms. Switch to streaming synth when tuning responsiveness. (STT/turn gates are already crushed: 142 ms / 1 ms.)
 - **Persistent OS-level daemon** (launchd/systemd, always-warm across CLI restarts) — revisit only if repeated cold-start model loads prove annoying in practice.
 - **Code Mode absorbing the reasoning loop** (full ask→decide→ask in-sandbox via a sub-LLM) — explicit non-goal; revisit only if per-turn latency/context proves unacceptable.
 - **Edge-case hardening beyond turn detection** (Section 7 of the original doc): false interruptions / barge-in recovery, low-confidence / garbled transcription handling, session hang & timeout fallback, extracting signal from long rambling answers, sequencing follow-ups when one answer surfaces multiple ambiguities, recognizing early-exit intent ("that's enough") as a control signal not an answer. Most are skill-reasoning concerns that firm up once the skill loop and a working prototype exist; graduate to tickets then.

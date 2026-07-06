@@ -28,7 +28,17 @@ ort           = "=2.0.0-rc.12"
 
 **Stage A (standalone voice round-trip) built — `grill-mcp/src/main.rs`.** Proven live: models load fast (Kokoro 264 ms, Parakeet ~480 ms, Silero VAD 9 ms), TTS synth + playback works (question spoke aloud). Weights downloaded to `grill-mcp/models/` (~740 MB on disk). Endpointing = trailing-silence VAD (`SmoothedVad`); `smart-turn-v3` deferred to 0004.
 
-**Full standalone round-trip PROVEN LIVE** — run from Ghostty (a mic-permitted terminal), the binary spoke the question, captured the mic, endpointed on VAD silence, and returned a correct transcript. (Latency numbers: TODO — paste from the run.)
+**Full standalone round-trip PROVEN LIVE** — run from Ghostty (a mic-permitted terminal), the binary spoke the question, captured the mic (1ch 48 kHz → resampled to 16 kHz), endpointed on VAD silence, and returned a correct transcript ("I think that it looks pretty great to be honest.").
+
+**Measured latency vs gate (M-series, release build):**
+
+| Gate | Target | Measured | Verdict |
+|---|---|---|---|
+| end-of-speech → transcript | ≤ 1000 ms | **142 ms** (37.9× realtime, 5.4 s audio) | ✅ crushed |
+| turn detection (final VAD frame) | ≤ 100 ms | **1 ms** | ✅ |
+| TTS text → first audio | ≤ 400 ms | **553 ms** | ⚠️ miss |
+
+Model loads: Kokoro 295 ms, Parakeet 563 ms, Silero VAD 10 ms. The STT bar is met on Parakeet/CPU with a 7× margin — **no Whisper-Metal fallback needed.** The TTS miss is the non-streaming `synth()` (whole sentence before first sample); fix = `kokoros` streaming API (first chunk ~100 ms) — a tuning item (0004), not an architecture problem.
 
 **Mic-permission note (macOS TCC):** the capture leg fails under host apps that don't surface the mic prompt to child processes (e.g. super.engineering: auth `.notDetermined`, device visible but unopenable) — **not a code bug**. Works from a normal terminal that can prompt:
 ```
