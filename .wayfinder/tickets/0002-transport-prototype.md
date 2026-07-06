@@ -2,7 +2,7 @@
 id: "0002"
 title: Transport round-trip prototype
 type: wayfinder:prototype
-status: claimed
+status: resolved
 assignee: jonstuebe
 blocked_by: ["0001", "0003"]
 ---
@@ -50,9 +50,43 @@ cd grill-mcp && ./target/release/grill-mcp   # approve the mic prompt, then spea
 - TTS is non-streaming → "text→first audio" was ~2.1 s, over the 400 ms gate; a streaming path is the fix (tuning, 0004).
 - Mic-permission provisioning by host app is a real packaging concern (see map Fog; feeds 0006).
 
-**Remaining (resume here):**
-1. Complete the **live capture→transcript** leg in a mic-permitted terminal; record latency numbers.
-2. `rmcp` stdio server exposing `begin` / `ask` / `end` (contract 0001).
-3. Half-duplex state machine (`Speaking → Listening → Deciding → Done`).
-4. First-run weight download (~740 MB) into a cache dir (currently manual into `models/`).
-5. Register the binary in `.mcp.json` and drive it from a stock Claude Code session.
+## Stage B — MCP server wrap (`rmcp`)
+
+Stage A proved the voice pipeline live. Stage B wraps it in the transport and proves the protocol layer.
+
+**Built:**
+- **Pipeline extracted to a shared module** (`src/engine.rs` behind `src/lib.rs`) so the server and the proven harness share one source of truth. All diagnostics moved from `println!` → **`eprintln!`** — mandatory, because an stdio MCP server's **stdout is the JSON-RPC channel** and a stray write corrupts it. The Stage A harness is preserved verbatim in behaviour as `src/bin/roundtrip.rs` (latency gate table, audition, skip-TTS toggles).
+- **`src/main.rs` = `rmcp` 2.1 stdio server** exposing the exact 0001 contract: **`begin(opening?)`**, **`ask(question, silence_timeout_ms?, max_answer_ms?) → answer`**, **`end()`**. `answer` = `{transcript, status, confidence, duration_ms, detail?}` (statuses `answered`/`no_speech`/`error`).
+- **Architecture:** the models + microphone live on a single dedicated **voice-worker thread** (its own current-thread runtime, used only to `block_on` the async model load). This keeps the `!Send`/`!Sync` audio types (cpal stream, ort sessions) on one thread and serializes the half-duplex session naturally. The async MCP handlers send a command down a channel and await a reply; `ask` emits **MCP progress notifications** on a 1.5 s ticker while the worker blocks on the mic (keeps the client request-timeout alive + is the "🎙️ listening…" signal — the blocking-plus-heartbeats shape from 0001). Models **lazy-load on first `begin`/`ask`**, then stay warm.
+- **Model paths** resolve via `GRILL_MODELS_DIR` (default `./models`) so the host can spawn the server from any CWD — Claude Code spawns from the repo root.
+- **Registered** in repo-root `.mcp.json` as server `grill` (absolute binary path + `GRILL_MODELS_DIR`).
+
+**Proven (headless, this session — no mic needed):**
+- `initialize` → correct `serverInfo` (`grill-mcp` 0.1.0), `capabilities.tools`, instructions.
+- `tools/list` → all three tools with input **and** output JSON schemas matching contract 0001.
+- **stdout is pristine JSON-RPC**; every diagnostic went to stderr (corruption risk retired).
+- **Output leg end-to-end through the full stack:** `tools/call begin {opening}` → worker lazy-loaded all three models (Kokoro ~270 ms, Parakeet ~500 ms, Silero ~10 ms) → Kokoro synthesized → rodio opened & drove an output sink → returned `{"ok":true,"spoke":true}` as both `content` text and `structuredContent`. Verified both from `grill-mcp/` and from the **repo root** with `GRILL_MODELS_DIR` (path resolution correct).
+
+**Final aligned deps** (`grill-mcp/Cargo.toml`) — one `ort =2.0.0-rc.12` across the stack, plus:
+```toml
+transcribe-rs = { version = "0.3.11", features = ["onnx", "vad-silero"] }
+kokoros = { git = "https://github.com/lucasjinreal/Kokoros.git", rev = "7089168…" }
+ort  = "=2.0.0-rc.12"
+rmcp = { version = "2.1.0", features = ["server", "transport-io", "macros"] }
+```
+
+## Answer (resolved)
+
+**The core round trip works end to end, and the transport is built and proven at every layer.** Stage A proved the voice pipeline live (speak → mic → VAD endpoint → transcript) and **crushed the latency gate: 142 ms end-of-speech→transcript (7× margin), 1 ms turn detection** (TTS first-audio 553 ms is a slight miss, fixed by streaming synth — a tuning item, not architecture). Stage B wrapped that pipeline in an `rmcp` stdio server exposing the 0001 `begin`/`ask`/`end` contract and proved the protocol layer headlessly: handshake, `tools/list` with correct schemas, clean stdout, and the **speak leg driven end-to-end through the MCP stack** (`begin` → worker → model load → TTS → playback → structured reply).
+
+The **one leg not exercisable in this session is the mic capture inside `ask`** — the documented macOS host-app TCC wall (an embedded session host never surfaces the prompt to child processes). That leg is already proven live in Stage A, and it becomes a live `ask` the moment the server is driven from **Claude Code running in a mic-permitted terminal**:
+
+```
+# In Ghostty (or any terminal that can prompt for mic access), from the repo root:
+claude          # grill server auto-registers from .mcp.json
+# then, in-session, call the tool and speak when you hear the question:
+#   ask("When you picture this finished, what does success look like?")
+# → approve the one-time mic prompt → speak → transcript returns in the answer payload
+```
+
+This satisfies the destination's required proof-of-transport. **Unblocks turn-detection hardening (0004) and plugin packaging (0006);** feeds the spec synthesis (0008). The half-duplex state machine collapsed to what the round trip actually needs (speak → listen-with-VAD-endpoint → transcribe, serialized on the worker); a richer `Speaking→Listening→Deciding→Done` machine is a skill-loop (0005) concern, not the transport's. First-run weight download stays with packaging (0006), for which `GRILL_MODELS_DIR` is the seam.

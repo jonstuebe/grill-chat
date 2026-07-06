@@ -28,3 +28,9 @@ Resolve:
 - **Marketplace** distribution (`marketplace.json`), `defaultEnabled: false`.
 
 Resolves when a `/plugin install` brings up the skill + auto-started MCP server and a grilling turn works end to end on Claude Code. Depends on the transport prototype (0002).
+
+## Groundwork from 0002 (transport prototype)
+
+- A working repo-root **`.mcp.json`** already registers the server (`grill`, absolute binary path + env). Packaging swaps these for `${CLAUDE_PLUGIN_ROOT}/bin/grill-mcp` and adds `alwaysLoad: true` + `timeout`.
+- **Model-dir seam exists:** the binary resolves weights from **`GRILL_MODELS_DIR`** (default `./models`). For the plugin, point it at `${CLAUDE_PLUGIN_DATA}/models` and fetch on first run — the ~1 GB weights (fp32 Kokoro 310 MB + Parakeet 656 MB + voices/VAD) are too large to vendor. `VoiceEngine::check_artifacts()` already fails fast with a clear message when a weight is missing — the hook point for a first-run download.
+- **Mic permission (TCC)** is a first-run UX item: access is inherited from whichever app hosts Claude Code. Needs a first-run check + guidance (see map Fog); playback works regardless.

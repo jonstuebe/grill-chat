@@ -1,296 +1,317 @@
-//! grill-mcp — transport prototype (ticket 0002), Stage A: standalone
-//! voice round-trip. Speak a hardcoded question (Kokoro TTS -> rodio),
-//! capture the mic (cpal), endpoint on VAD-silence (transcribe-rs Silero
-//! VAD), transcribe (Parakeet), print transcript + latency numbers.
+//! grill-mcp — the transport (ticket 0002, Stage B): an `rmcp` stdio MCP server
+//! that wraps the proven [`grill_mcp::engine`] voice pipeline behind the 3-tool
+//! contract from ticket 0001 (`begin` / `ask` / `end`) over one implicit
+//! session (one mic, one user, no session IDs). All conversation state stays
+//! with the caller; this binary reports mechanical facts only.
 //!
-//! Semantic end-of-turn (smart-turn-v3) is deliberately deferred to the
-//! turn-detection-tuning ticket (0004); trailing-silence VAD is enough to
-//! prove the transport round-trip and measure the latency gate.
+//! Architecture: the voice models + microphone live on a single dedicated
+//! **worker thread** (its own current-thread runtime, used only to `block_on`
+//! the async model load). This keeps the `!Send`/`!Sync` audio types (cpal
+//! stream, ort sessions) on one thread and serializes the half-duplex session
+//! naturally. The async MCP handlers send a command down a channel, await a
+//! reply, and — for the blocking `ask` — emit MCP progress notifications on a
+//! ticker so the client's request timeout never fires while we listen.
+//!
+//! stdout is the JSON-RPC channel; ALL diagnostics go to stderr.
 
-use std::num::NonZero;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use anyhow::Result;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::{
+    ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::transport::stdio;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use kokoros::tts::koko::TTSKoko;
-use transcribe_rs::onnx::parakeet::{ParakeetModel, ParakeetParams};
-use transcribe_rs::onnx::Quantization;
-use transcribe_rs::vad::{SileroVad, SmoothedVad, Vad};
+use grill_mcp::engine::{Answer, AnswerStatus, ListenCfg, VoiceEngine};
 
-const QUESTION: &str = "When you picture this finished, what does success actually look like?";
+/// Commands sent from the async MCP layer to the voice-worker thread.
+enum Cmd {
+    Begin {
+        opening: Option<String>,
+        reply: oneshot::Sender<std::result::Result<bool, String>>, // Ok(spoke?)
+    },
+    Ask {
+        question: String,
+        cfg: ListenCfg,
+        reply: oneshot::Sender<Answer>,
+    },
+    End {
+        reply: oneshot::Sender<()>,
+    },
+}
 
-// Model artifacts (downloaded into ./models on first run).
-// TTS uses the `kokoros` crate + fp32 Kokoro-v1.0 (same engine/weights as the
-// `yap` project) — noticeably more natural English than the int8 mzdk100 fork.
-const KOKORO_MODEL: &str = "models/kokoro-v1.0.onnx";
-const KOKORO_VOICES: &str = "models/voices-v1.0.bin";
-const TTS_LANG: &str = "en-us";
-const TTS_SPEED: f32 = 1.0;
-const PARAKEET_DIR: &str = "models/parakeet-tdt-0.6b-v3-int8";
-const SILERO_VAD: &str = "models/silero_vad_v4.onnx";
+/// Spawn the dedicated voice-worker thread and return its command sender.
+/// Models lazy-load on the first `begin`/`ask` and then stay warm.
+fn spawn_worker() -> mpsc::UnboundedSender<Cmd> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Cmd>();
+    std::thread::Builder::new()
+        .name("voice-worker".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build voice-worker runtime");
+            let mut engine: Option<VoiceEngine> = None;
 
-// Endpointing thresholds.
-const VAD_SR: u32 = 16_000; // Silero VAD + Parakeet operate at 16 kHz.
-const VAD_FRAME: usize = 480; // 30 ms @ 16 kHz (SileroVad::frame_size()).
-const END_SILENCE_MS: u64 = 800; // trailing silence that ends a turn.
-const INITIAL_SILENCE_MS: u64 = 8_000; // give up if the user never speaks.
-const MAX_ANSWER_MS: u64 = 30_000; // hard cap on a single answer.
+            while let Some(cmd) = rx.blocking_recv() {
+                match cmd {
+                    Cmd::Begin { opening, reply } => {
+                        let r = (|| -> Result<bool> {
+                            let eng = ensure_loaded(&mut engine, &rt)?;
+                            match opening.as_deref() {
+                                Some(text) => {
+                                    eng.speak(text)?;
+                                    Ok(true)
+                                }
+                                None => Ok(false),
+                            }
+                        })();
+                        let _ = reply.send(r.map_err(|e| e.to_string()));
+                    }
+                    Cmd::Ask { question, cfg, reply } => {
+                        let ans = match ensure_loaded(&mut engine, &rt) {
+                            Ok(eng) => eng.ask_turn(&question, cfg),
+                            Err(e) => Answer {
+                                transcript: String::new(),
+                                status: AnswerStatus::Error,
+                                confidence: 0.0,
+                                duration_ms: 0,
+                                detail: Some(e.to_string()),
+                            },
+                        };
+                        let _ = reply.send(ans);
+                    }
+                    Cmd::End { reply } => {
+                        // Models stay warm for reuse; the mic is already dropped
+                        // at the end of every `listen`, so there's nothing else
+                        // to release. This is the contract's teardown ack.
+                        let _ = reply.send(());
+                    }
+                }
+            }
+            eprintln!("[worker] command channel closed; voice-worker exiting");
+        })
+        .expect("spawn voice-worker thread");
+    tx
+}
+
+/// Load the models on first use (blocking on the worker's own runtime).
+fn ensure_loaded<'a>(
+    engine: &'a mut Option<VoiceEngine>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<&'a mut VoiceEngine> {
+    if engine.is_none() {
+        eprintln!("[worker] loading models (first use)…");
+        let (e, _timings) = rt.block_on(VoiceEngine::load())?;
+        *engine = Some(e);
+    }
+    Ok(engine.as_mut().expect("engine loaded"))
+}
+
+// ---------- MCP tool argument / result shapes ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BeginArgs {
+    /// Optional framing sentence to speak aloud before any question.
+    #[serde(default)]
+    opening: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AskArgs {
+    /// The question to speak aloud, then listen for an answer to.
+    question: String,
+    /// Give up with `no_speech` if the user never starts speaking within this
+    /// many milliseconds (default 8000).
+    #[serde(default)]
+    silence_timeout_ms: Option<u64>,
+    /// Hard cap on a single answer in milliseconds (default 30000).
+    #[serde(default)]
+    max_answer_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct BeginAck {
+    ok: bool,
+    /// Whether an opening line was spoken.
+    spoke: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct EndAck {
+    ok: bool,
+}
+
+/// The `answer` payload from contract 0001.
+#[derive(Debug, Serialize, JsonSchema)]
+struct AskAnswer {
+    transcript: String,
+    /// "answered" | "no_speech" | "error"
+    status: String,
+    /// 0–1, STT-derived; carried but not acted on by the binary.
+    confidence: f64,
+    /// Captured answer audio length, in ms.
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl From<Answer> for AskAnswer {
+    fn from(a: Answer) -> Self {
+        Self {
+            transcript: a.transcript,
+            status: a.status.as_str().to_string(),
+            confidence: a.confidence as f64,
+            duration_ms: a.duration_ms,
+            detail: a.detail,
+        }
+    }
+}
+
+// ---------- The server ----------
+
+#[derive(Clone)]
+struct GrillServer {
+    tx: mpsc::UnboundedSender<Cmd>,
+    tool_router: ToolRouter<GrillServer>,
+}
+
+impl GrillServer {
+    fn new(tx: mpsc::UnboundedSender<Cmd>) -> Self {
+        Self {
+            tx,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn worker_gone() -> ErrorData {
+        ErrorData::internal_error("voice worker is not running", None)
+    }
+    fn no_reply() -> ErrorData {
+        ErrorData::internal_error("voice worker dropped the reply", None)
+    }
+}
+
+#[tool_router]
+impl GrillServer {
+    #[tool(
+        description = "Begin the voice session. If `opening` is given, speak it aloud as a framing line before any question. Optional — the first `ask` auto-begins the session."
+    )]
+    async fn begin(
+        &self,
+        Parameters(args): Parameters<BeginArgs>,
+    ) -> std::result::Result<Json<BeginAck>, ErrorData> {
+        let (rtx, rrx) = oneshot::channel();
+        self.tx
+            .send(Cmd::Begin {
+                opening: args.opening,
+                reply: rtx,
+            })
+            .map_err(|_| Self::worker_gone())?;
+        let spoke = rrx
+            .await
+            .map_err(|_| Self::no_reply())?
+            .map_err(|e| ErrorData::internal_error(e, None))?;
+        Ok(Json(BeginAck { ok: true, spoke }))
+    }
+
+    #[tool(
+        description = "Speak `question` aloud, listen to the microphone, detect end-of-turn (trailing-silence VAD), and return the finalized transcript. Blocking — one call yields one answer — and emits progress notifications while listening so the request never times out."
+    )]
+    async fn ask(
+        &self,
+        Parameters(args): Parameters<AskArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<Json<AskAnswer>, ErrorData> {
+        let defaults = ListenCfg::default();
+        let cfg = ListenCfg {
+            end_silence_ms: defaults.end_silence_ms,
+            initial_silence_ms: args.silence_timeout_ms.unwrap_or(defaults.initial_silence_ms),
+            max_answer_ms: args.max_answer_ms.unwrap_or(defaults.max_answer_ms),
+        };
+
+        let (rtx, mut rrx) = oneshot::channel::<Answer>();
+        self.tx
+            .send(Cmd::Ask {
+                question: args.question,
+                cfg,
+                reply: rtx,
+            })
+            .map_err(|_| Self::worker_gone())?;
+
+        // Heartbeat: keep the client's request timeout alive and drive the
+        // "🎙️ listening…" indicator while the worker blocks on the mic.
+        let token: Option<ProgressToken> = ctx.meta.get_progress_token();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(1500));
+        ticker.tick().await; // consume the immediate first tick
+        let mut progress = 0.0f64;
+
+        let answer = loop {
+            tokio::select! {
+                r = &mut rrx => break r.map_err(|_| Self::no_reply())?,
+                _ = ticker.tick() => {
+                    progress += 1.0;
+                    if let Some(t) = token.clone() {
+                        let _ = ctx.peer.notify_progress(
+                            ProgressNotificationParam::new(t, progress).with_message("listening…"),
+                        ).await;
+                    }
+                }
+            }
+        };
+        Ok(Json(AskAnswer::from(answer)))
+    }
+
+    #[tool(
+        description = "End the voice session: stop listening/speaking and release the audio device. Safety-net teardown; the models stay warm for the process lifetime."
+    )]
+    async fn end(&self) -> std::result::Result<Json<EndAck>, ErrorData> {
+        let (rtx, rrx) = oneshot::channel();
+        self.tx
+            .send(Cmd::End { reply: rtx })
+            .map_err(|_| Self::worker_gone())?;
+        rrx.await.map_err(|_| Self::no_reply())?;
+        Ok(Json(EndAck { ok: true }))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for GrillServer {
+    fn get_info(&self) -> ServerInfo {
+        // ServerInfo / Implementation are #[non_exhaustive]; mutate a default
+        // rather than constructing with a struct literal.
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info.name = "grill-mcp".into();
+        info.server_info.version = env!("CARGO_PKG_VERSION").into();
+        info.instructions = Some(
+            "Voice transport for grilling. begin(opening?) speaks a framing line; \
+             ask(question) speaks it, listens, and returns the transcript; end() releases \
+             the mic. One implicit session (one mic, one user); all conversation state stays \
+             with the caller."
+                .into(),
+        );
+        info
+    }
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    for p in [KOKORO_MODEL, KOKORO_VOICES, PARAKEET_DIR, SILERO_VAD] {
-        if !std::path::Path::new(p).exists() {
-            anyhow::bail!("missing model artifact: {p} (run the model download first)");
-        }
+async fn main() -> Result<()> {
+    // Warn early (on stderr) if weights are missing — before we touch stdio.
+    if let Err(e) = VoiceEngine::check_artifacts() {
+        eprintln!("[grill-mcp] warning: {e}");
     }
 
-    // --- Load models (lazy in a real server; eager here to isolate timing). ---
-    let t = Instant::now();
-    let tts = TTSKoko::new(KOKORO_MODEL, KOKORO_VOICES).await;
-    println!("[load] Kokoro TTS      {:>7.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+    let tx = spawn_worker();
+    let server = GrillServer::new(tx);
+    eprintln!("[grill-mcp] serving MCP over stdio (tools: begin, ask, end)…");
 
-    // GRILL_AUDITION=1 -> speak the question in each candidate voice and exit,
-    // so we can pick one by ear (playback works even where the mic is blocked).
-    if std::env::var("GRILL_AUDITION").is_ok() {
-        for name in candidate_voices() {
-            println!("\n> {name}");
-            let audio = tts.tts_raw_audio(
-                &format!("This is {name}. {QUESTION}"),
-                TTS_LANG, name, TTS_SPEED, None, None, None, None,
-            ).map_err(|e| anyhow::anyhow!("synth failed: {e}"))?;
-            play_blocking(&audio, 24_000)?;
-        }
-        return Ok(());
-    }
-
-    let t = Instant::now();
-    let mut stt = ParakeetModel::load(&PathBuf::from(PARAKEET_DIR), &Quantization::Int8)?;
-    println!("[load] Parakeet STT    {:>7.0} ms", t.elapsed().as_secs_f64() * 1000.0);
-
-    let t = Instant::now();
-    let silero = SileroVad::new(&PathBuf::from(SILERO_VAD), 0.3)?;
-    let mut vad = SmoothedVad::new(Box::new(silero), 15, 15, 2);
-    println!("[load] Silero VAD      {:>7.0} ms", t.elapsed().as_secs_f64() * 1000.0);
-
-    // ---------- SPEAK ---------- (GRILL_SKIP_TTS=1 to iterate on the mic path)
-    if std::env::var("GRILL_SKIP_TTS").is_err() {
-        let voice = voice_from_env();
-        println!("\n> speaking (voice={voice}): {QUESTION:?}");
-        let t_tts = Instant::now();
-        let audio = tts
-            .tts_raw_audio(QUESTION, TTS_LANG, &voice, TTS_SPEED, None, None, None, None)
-            .map_err(|e| anyhow::anyhow!("synth failed: {e}"))?;
-        // Non-streaming synth: "text -> first audio" == full synth time here.
-        println!(
-            "[GATE] TTS text->first audio  {:>7.0} ms  (target <= 400)",
-            t_tts.elapsed().as_secs_f64() * 1000.0
-        );
-        play_blocking(&audio, 24_000)?;
-        println!("[tts] spoke {:.1}s of audio in {:.0} ms wall",
-            audio.len() as f64 / 24_000.0, t_tts.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    // ---------- LISTEN ----------
-    println!("\n🎙️  listening… (speak, then pause)");
-    let (samples16k, turn) = listen(&mut vad)?;
-    match turn.status {
-        TurnStatus::NoSpeech => {
-            println!("[listen] no speech detected within {INITIAL_SILENCE_MS} ms");
-            return Ok(());
-        }
-        TurnStatus::MaxAnswer => println!("[listen] hit max-answer cap"),
-        TurnStatus::EndOfTurn => {}
-    }
-    println!(
-        "[GATE] turn detection (last frame) {:>4.0} ms  (target <= 100)",
-        turn.last_vad_ms
-    );
-
-    // ---------- TRANSCRIBE ----------
-    let t_stt = Instant::now();
-    let result = stt.transcribe_with(&samples16k, &ParakeetParams::default())?;
-    let stt_ms = t_stt.elapsed().as_secs_f64() * 1000.0;
-    let audio_s = samples16k.len() as f64 / VAD_SR as f64;
-    println!(
-        "[GATE] end-of-speech->transcript {:>6.0} ms  (target <= 1000; {:.1}x realtime, {:.1}s audio)",
-        stt_ms,
-        audio_s / (stt_ms / 1000.0),
-        audio_s
-    );
-
-    println!("\n===> TRANSCRIPT: {:?}", result.text.trim());
-    Ok(())
-}
-
-#[derive(Debug)]
-enum TurnStatus {
-    EndOfTurn,
-    NoSpeech,
-    MaxAnswer,
-}
-
-struct Turn {
-    status: TurnStatus,
-    last_vad_ms: f64, // cost of the final VAD frame inference.
-}
-
-/// Capture the default input device until the turn ends (trailing silence),
-/// returning 16 kHz mono f32 samples ready for Parakeet.
-fn listen(vad: &mut SmoothedVad) -> anyhow::Result<(Vec<f32>, Turn)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no input device"))?;
-    #[allow(deprecated)]
-    let dev_name = device.name().unwrap_or_default();
-    println!("[mic] device: {dev_name:?}");
-
-    // Raw mono f32 at the device rate, filled from the audio callback.
-    let raw = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let err_fn = |e| eprintln!("stream error: {e}");
-
-    // Attempt build_input_stream directly with explicit configs. This *device
-    // access* is what triggers the macOS mic-permission prompt (a property
-    // query like default_input_config() only errors when unauthorized). We try
-    // a few common (rate, channels, format) combos and keep the first that
-    // opens — also learning the real device rate/channels for resampling.
-    let mut chosen: Option<(cpal::Stream, u32, usize)> = None;
-    'outer: for &sr in &[48_000u32, 44_100, 16_000] {
-        for &ch in &[1u16, 2] {
-            // NOTE: under a host app without mic entitlement (e.g. an embedded
-            // session host), these opens fail with misleading "device
-            // unavailable" errors and no TCC prompt. Run from a normal terminal
-            // that can prompt for microphone access. See ticket 0002 / map Fog.
-            let cfg = cpal::StreamConfig {
-                channels: ch,
-                sample_rate: sr,
-                buffer_size: cpal::BufferSize::Default,
-            };
-            let raw_cb = raw.clone();
-            let chn = ch as usize;
-            // Mic default format is f32 on macOS; build an f32 input stream.
-            match device.build_input_stream(
-                &cfg,
-                move |data: &[f32], _: &_| push_mono(&raw_cb, data, chn),
-                err_fn,
-                None,
-            ) {
-                Ok(s) => {
-                    println!("[mic] opened stream: {ch}ch {sr} Hz f32");
-                    chosen = Some((s, sr, chn));
-                    break 'outer;
-                }
-                Err(e) => println!("[mic] {ch}ch {sr}Hz f32 -> {e}"),
-            }
-        }
-    }
-    let (stream, dev_sr, _channels) = chosen.ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not open any input config — grant microphone permission to the host app \
-             ({dev_name:?} was visible but unopenable)"
-        )
-    })?;
-    stream.play()?;
-
-    let start = Instant::now();
-    let mut fed_frames = 0usize; // 16 kHz frames already handed to the VAD.
-    let mut speech_started = false;
-    let mut trailing_silence = 0usize; // consecutive non-speech frames after speech.
-    let mut last_vad_ms = 0.0;
-    let end_frames = (END_SILENCE_MS as usize * VAD_SR as usize / 1000) / VAD_FRAME;
-
-    let status = loop {
-        std::thread::sleep(Duration::from_millis(30));
-        let elapsed = start.elapsed().as_millis() as u64;
-
-        let snapshot = { raw.lock().unwrap().clone() };
-        let mono16k = resample_linear(&snapshot, dev_sr, VAD_SR);
-
-        while (fed_frames + 1) * VAD_FRAME <= mono16k.len() {
-            let frame = &mono16k[fed_frames * VAD_FRAME..(fed_frames + 1) * VAD_FRAME];
-            let t = Instant::now();
-            let is_speech = vad.is_speech(frame).unwrap_or(false);
-            last_vad_ms = t.elapsed().as_secs_f64() * 1000.0;
-            if is_speech {
-                speech_started = true;
-                trailing_silence = 0;
-            } else if speech_started {
-                trailing_silence += 1;
-            }
-            fed_frames += 1;
-        }
-
-        if speech_started && trailing_silence >= end_frames {
-            break TurnStatus::EndOfTurn;
-        }
-        if !speech_started && elapsed >= INITIAL_SILENCE_MS {
-            break TurnStatus::NoSpeech;
-        }
-        if elapsed >= MAX_ANSWER_MS {
-            break TurnStatus::MaxAnswer;
-        }
-    };
-
-    drop(stream); // stop capture
-    let final16k = resample_linear(&raw.lock().unwrap(), dev_sr, VAD_SR);
-    Ok((final16k, Turn { status, last_vad_ms }))
-}
-
-/// Downmix interleaved frames to mono and append to the shared buffer.
-fn push_mono(buf: &Arc<Mutex<Vec<f32>>>, data: &[f32], channels: usize) {
-    let mut b = buf.lock().unwrap();
-    if channels <= 1 {
-        b.extend_from_slice(data);
-    } else {
-        for frame in data.chunks(channels) {
-            b.push(frame.iter().sum::<f32>() / channels as f32);
-        }
-    }
-}
-
-/// Rate-agnostic linear resampler (prototype-grade; good enough for STT).
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
-    if from == to || input.is_empty() {
-        return input.to_vec();
-    }
-    let ratio = to as f64 / from as f64;
-    let out_len = (input.len() as f64 * ratio) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        let idx = src.floor() as usize;
-        let frac = (src - idx as f64) as f32;
-        let a = input.get(idx).copied().unwrap_or(0.0);
-        let b = input.get(idx + 1).copied().unwrap_or(a);
-        out.push(a + (b - a) * frac);
-    }
-    out
-}
-
-/// Candidate interview voices to audition (kokoros voice names).
-fn candidate_voices() -> Vec<&'static str> {
-    vec![
-        "af_heart", "af_bella", "af_nicole", "af_aoede", "am_michael", "am_puck",
-        "am_fenrir", "bf_emma", "bm_george",
-    ]
-}
-
-/// Voice selected by GRILL_VOICE, else af_heart (yap's default).
-fn voice_from_env() -> String {
-    std::env::var("GRILL_VOICE").unwrap_or_else(|_| "af_heart".into())
-}
-
-/// Play mono f32 samples at `sr` Hz and block until playback finishes.
-fn play_blocking(audio: &[f32], sr: u32) -> anyhow::Result<()> {
-    let sink = rodio::DeviceSinkBuilder::open_default_sink()?;
-    let buf = rodio::buffer::SamplesBuffer::new(
-        NonZero::new(1u16).unwrap(),
-        NonZero::new(sr).unwrap(),
-        audio.to_vec(),
-    );
-    sink.mixer().add(buf);
-    let dur = Duration::from_secs_f64(audio.len() as f64 / sr as f64 + 0.2);
-    std::thread::sleep(dur);
+    let service = server.serve(stdio()).await?;
+    service.waiting().await?;
     Ok(())
 }

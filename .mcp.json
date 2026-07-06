@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "grill": {
+      "command": "/Users/jonstuebe/code/grill-chat/grill-mcp/target/release/grill-mcp",
+      "args": [],
+      "env": {
+        "GRILL_MODELS_DIR": "/Users/jonstuebe/code/grill-chat/grill-mcp/models"
+      }
+    }
+  }
+}

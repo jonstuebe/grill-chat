@@ -15,7 +15,12 @@ transcribe-rs = { version = "0.3.11", features = ["onnx", "vad-silero"] }
 kokoros = { git = "https://github.com/lucasjinreal/Kokoros.git", rev = "7089168f0ca2d8e1fcd8e523c9d75d915c6afdff" }
 # Direct ort handle for the self-wired smart-turn-v3 endpointing model — same rc.12.
 ort = "=2.0.0-rc.12"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1.0.103"
 rodio = "0.22.2"
 cpal = "=0.17.3"
+# MCP server (stdio transport + tool macros) — the transport half of the spec.
+rmcp = { version = "2.1.0", features = ["server", "transport-io", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
