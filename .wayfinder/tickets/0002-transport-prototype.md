@@ -28,7 +28,9 @@ ort           = "=2.0.0-rc.12"
 
 **Stage A (standalone voice round-trip) built — `grill-mcp/src/main.rs`.** Proven live: models load fast (Kokoro 264 ms, Parakeet ~480 ms, Silero VAD 9 ms), TTS synth + playback works (question spoke aloud). Weights downloaded to `grill-mcp/models/` (~740 MB on disk). Endpointing = trailing-silence VAD (`SmoothedVad`); `smart-turn-v3` deferred to 0004.
 
-**Blocker hit — mic permission (macOS TCC):** the capture→transcript leg is blocked because this dev session runs under a host app (super.engineering) that does not surface the microphone prompt to child processes (auth stays `.notDetermined`; device visible but unopenable). **Not a code bug** — a host-app entitlement issue. To finish the live capture leg, run the binary from a normal terminal that can prompt for mic access:
+**Full standalone round-trip PROVEN LIVE** — run from Ghostty (a mic-permitted terminal), the binary spoke the question, captured the mic, endpointed on VAD silence, and returned a correct transcript. (Latency numbers: TODO — paste from the run.)
+
+**Mic-permission note (macOS TCC):** the capture leg fails under host apps that don't surface the mic prompt to child processes (e.g. super.engineering: auth `.notDetermined`, device visible but unopenable) — **not a code bug**. Works from a normal terminal that can prompt:
 ```
 cd grill-mcp && ./target/release/grill-mcp   # approve the mic prompt, then speak
 ```
