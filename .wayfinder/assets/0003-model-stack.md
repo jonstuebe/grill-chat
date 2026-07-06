@@ -57,3 +57,7 @@ If STT misses the bar on Parakeet/CPU → switch `transcribe-rs` to the **Whispe
 - `smart-turn-v3`: https://huggingface.co/pipecat-ai/smart-turn-v3 · https://www.daily.co/blog/announcing-smart-turn-v3-with-cpu-inference-in-just-12ms/
 - `sherpa-onnx` (official Rust) / `sherpa-rs` archived: https://crates.io/crates/sherpa-onnx · https://github.com/thewh1teagle/sherpa-rs · Kokoro in sherpa https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/kokoro.html
 - `whisper-rs`: https://github.com/tazz4843/whisper-rs
+
+## Correction (from 0002, prototype)
+
+The TTS pick above named the `kokoro-tts` crate (mzdk100 fork, int8). In the prototype its English sounded unnatural. **Replaced with the original `kokoros` crate** (lucasjinreal git, pinned to yap's commit; still `ort` =2.0.0-rc.12, so alignment holds) + the **fp32** `kokoro-v1.0.onnx` (~310 MB, up from 88 MB int8) — the same stack the `yap` project uses. Confirmed much more natural. Consequences: total footprint grows (~310 MB TTS instead of ~88 MB); English g2p is `espeak-rs`/espeak-ng (statically linked, GPL-3.0 — the shipping-gate is now realized).

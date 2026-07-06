@@ -26,9 +26,21 @@ kokoro-tts    = "0.3.3"
 ort           = "=2.0.0-rc.12"
 ```
 
-**Remaining (needs a live mic + speakers — resume here):**
-1. `rmcp` stdio server exposing `begin` / `ask` / `end` (contract 0001).
-2. Half-duplex state machine (`Speaking → Listening → Deciding → Done`).
-3. First-run weight download (~700 MB) into a cache dir.
-4. Self-wire `smart-turn-v3` (mel front end + `ort` session) for end-of-turn.
-5. **Live round trip** + measure against the latency gate. Register the built binary in `.mcp.json` and drive it from a stock Claude Code session.
+**Stage A (standalone voice round-trip) built — `grill-mcp/src/main.rs`.** Proven live: models load fast (Kokoro 264 ms, Parakeet ~480 ms, Silero VAD 9 ms), TTS synth + playback works (question spoke aloud). Weights downloaded to `grill-mcp/models/` (~740 MB on disk). Endpointing = trailing-silence VAD (`SmoothedVad`); `smart-turn-v3` deferred to 0004.
+
+**Blocker hit — mic permission (macOS TCC):** the capture→transcript leg is blocked because this dev session runs under a host app (super.engineering) that does not surface the microphone prompt to child processes (auth stays `.notDetermined`; device visible but unopenable). **Not a code bug** — a host-app entitlement issue. To finish the live capture leg, run the binary from a normal terminal that can prompt for mic access:
+```
+cd grill-mcp && ./target/release/grill-mcp   # approve the mic prompt, then speak
+```
+
+**Findings so far:**
+- **TTS engine swapped** (mid-0002): the `kokoro-tts` mzdk100 int8 fork sounded unnaturally English. Replaced with the original **`kokoros`** crate (lucasjinreal git, `ort` rc.12 — alignment preserved) + **fp32** `kokoro-v1.0.onnx`, matching the `yap` project. Confirmed much more natural; default voice `af_heart` (override via `GRILL_VOICE`). Corrects the 0003 model-stack decision (crate + precision). GPL note now realized: `espeak-rs-sys` (espeak-ng) is statically linked.
+- TTS is non-streaming → "text→first audio" was ~2.1 s, over the 400 ms gate; a streaming path is the fix (tuning, 0004).
+- Mic-permission provisioning by host app is a real packaging concern (see map Fog; feeds 0006).
+
+**Remaining (resume here):**
+1. Complete the **live capture→transcript** leg in a mic-permitted terminal; record latency numbers.
+2. `rmcp` stdio server exposing `begin` / `ask` / `end` (contract 0001).
+3. Half-duplex state machine (`Speaking → Listening → Deciding → Done`).
+4. First-run weight download (~740 MB) into a cache dir (currently manual into `models/`).
+5. Register the binary in `.mcp.json` and drive it from a stock Claude Code session.

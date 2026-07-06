@@ -1,1 +1,3 @@
 /target
+# Model weights (~1.1 GB) are downloaded locally, never committed.
+/models

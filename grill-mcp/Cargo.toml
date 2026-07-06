@@ -9,7 +9,13 @@ edition = "2024"
 # Whisper+Metal fallback is a one-line add later: features = [..., "whisper-metal"].
 # CoreML EP is opt-in via "ort-coreml" (flaky for Parakeet — stay on CPU for now).
 transcribe-rs = { version = "0.3.11", features = ["onnx", "vad-silero"] }
-# TTS — Kokoro-82M; pins ort ^2.0.0-rc.12, unifies with transcribe-rs's rc.12.
-kokoro-tts = "0.3.3"
+# TTS — Kokoro-82M via the original lucasjinreal `kokoros` (English-focused,
+# proper espeak-rs g2p; same engine/weights as the `yap` project). Pinned to
+# yap's commit; depends on ort =2.0.0-rc.12, unifying with transcribe-rs.
+kokoros = { git = "https://github.com/lucasjinreal/Kokoros.git", rev = "7089168f0ca2d8e1fcd8e523c9d75d915c6afdff" }
 # Direct ort handle for the self-wired smart-turn-v3 endpointing model — same rc.12.
 ort = "=2.0.0-rc.12"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+anyhow = "1.0.103"
+rodio = "0.22.2"
+cpal = "=0.17.3"
